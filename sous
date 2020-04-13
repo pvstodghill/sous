@@ -1,0 +1,296 @@
+#! /usr/bin/env perl
+
+use strict;
+use warnings;
+# use Carp::Always;
+
+# use FindBin;
+# use lib "$FindBin::Bin";
+# use Xyzzy;
+
+use constant { TRUE => 1, FALSE => 0 };
+
+# ------------------------------------------------------------------------
+# !!! NOTE !!!
+#
+# All indices are 0-based.
+#
+# fails to terminate properly if an accession contains _no_ unique
+# sequences. should set result to \inf
+#
+# hard wired for circular genomes
+# ------------------------------------------------------------------------
+
+# ------------------------------------------------------------------------
+# Process the command line
+# ------------------------------------------------------------------------
+
+use File::Basename;
+use Getopt::Std;
+
+our $opt_D = 2;
+our $opt_L = 1;
+our $opt_U;
+our $opt_d = ".";
+our $opt_h;
+our $opt_t;
+our $opt_u;
+our $opt_q;
+
+sub usage {
+  my $progname = basename($0);
+  print STDERR "Usage: $progname [options] *.fna\n";
+
+  print STDERR "-D INCR - increment of k (even) [2]\n";
+  print STDERR "-L LB - minimum k (odd) [1]\n";
+  print STDERR "-U LB - maximum k [\\inf]\n";
+  print STDERR "-d DIR - output directory [.]\n";
+  print STDERR "-h - print help\n";
+  print STDERR "-t TAG - tag for output sous files (required, unless -u)\n";
+  print STDERR "-u TAG - tag for output uniqueness files (required, unless -t)\n";
+  print STDERR "-q - be quiet\n";
+
+  exit(@_);
+}
+
+my $stat = getopts('D:L:U:d:hqt:u:');
+if (!$stat) {
+  usage(1);
+}
+if ($opt_h) {
+  usage();
+}
+
+if ( !defined($opt_t) && !defined($opt_u) ) {
+  print STDERR "Missing -t or -u.\n";
+  usage(1);
+}
+
+if ( $opt_L % 2 != 1 ) {
+  print STDERR "-L arg must be odd\n";
+  usage(1);
+}
+
+if ( $opt_D % 2 != 0 ) {
+  print STDERR "-D arg must be even\n";
+  usage(1);
+}
+my $incr = $opt_D/2;
+
+
+# ------------------------------------------------------------------------
+# Read the molecules
+# ------------------------------------------------------------------------
+
+my %molecules;
+
+print STDERR "# Read the molecules\n";
+
+foreach my $fasta_file ( @ARGV ) {
+  open(my $fh, "<", $fasta_file) || die "Cannot open <<$fasta_file>>,";
+  my $accession;
+  my $sequence = "";
+  while (<$fh>) {
+    chomp;
+    if ( /^[ \t]*$/ ) {
+      next;
+    } elsif ( /^>([^ ]*)/ ) {
+      if (defined($accession)) {
+	$molecules{$accession} = $sequence;
+      }
+      $accession = $1;
+      $sequence = "";
+    } else {
+      ( /^[ACGNTacgnt]/ ) || die "What is this? <<$_>>,";
+      ( !/[Nn]/ ) || die "N's detected in $accession,";
+      $sequence .= lc($_);
+    }
+  }
+  close $fh;
+  if (defined($accession)) {
+    $molecules{$accession} = $sequence;
+  }
+}
+
+# ------------------------------------------------------------------------
+# Initializing the results vector
+# ------------------------------------------------------------------------
+
+my $num_results = 0;
+my $results = {};
+
+print STDERR "# Initializing the results vector\n";
+
+foreach my $accession (keys(%molecules)) {
+  my $sequence = $molecules{$accession};
+  my $n = length($sequence);
+  my $a = [];
+  # there is probably a faster way to do this.
+  for (my $i=0; $i<$n; $i++) {
+    push @{$a}, -1;
+  }
+  $results->{$accession} = $a;
+}
+
+# ------------------------------------------------------------------------
+# useful routine
+# ------------------------------------------------------------------------
+
+# return substr of $s, handle wrapping the origin.
+
+sub get {
+  my ($s,$start,$end) = @_;
+  # ($start <= $end) || die;
+  my $n = length($s);
+  my $len = $end - $start + 1;
+  # ($len <= $n) || die;
+  while ( $start < 0 && $end < 0 ) {
+    $start += $n;
+    $end += $n;
+  }
+  while ( $n <= $start && $n <= $end ) {
+    $start -= $n;
+    $end -= $n;
+  }
+  # ( 0 <= $start || $end < $n) || die;
+  if ( 0 <= $start && $end < $n ) {
+    return substr($s,$start,$len);
+  } elsif ( $start < 0 && $end < $n ) {
+    return ( substr($s,$n+$start,-$start) 
+	     . substr($s,0,$end+1) );
+  } elsif ( 0 <= $start && $n <= $end ) {
+    return ( substr($s,$start,$n-$start)
+	     . substr($s, 0, $end-$n+1) );
+  } else {
+    die "huh? n=$n, start=$start, end=$end,";
+  }
+}
+
+sub rev_comp {
+  my ($s) = @_;
+  $s = reverse($s);
+  $s =~ tr/acgt/tgca/;
+  return $s;
+}
+
+
+# ------------------------------------------------------------------------
+# Construct the first set of k-mers
+# ------------------------------------------------------------------------
+
+# Positions are [accession,index] pairs.
+
+my $num_positions;
+
+my $k = $opt_L;
+my $kmers = {};
+
+print STDERR "# Initializing for k=$k\n";
+
+foreach my $accession (keys(%molecules)) {
+  my $s = $molecules{$accession};
+  my $n = length($s);
+  for (my $i=0; $i<$n; $i++) {
+    my $c = substr($s,$i,1);
+    my $strand = ( $c eq "a" || $c eq "c" ) ? "+" : "-";
+    my $position = [$accession, $i, $strand];
+    my $start = $i - ($k - 1)/2;
+    my $end = $start + $k - 1;
+    my $ss = get($s,$start,$end);
+    my $kmer = ($strand eq "+") ? $ss : rev_comp($ss);
+    if ( !defined($kmers->{$kmer}) ) {
+      $kmers->{$kmer} = [];
+    }
+    push @{$kmers->{$kmer}}, $position;
+    $num_positions++;
+  }
+}
+
+# ------------------------------------------------------------------------
+# Revise and extend
+# ------------------------------------------------------------------------
+
+print STDERR "# Processing initial sets\n";
+recurs($k,$kmers);
+
+sub recurs {
+  no warnings 'recursion'; 
+  my ($old_k,$old_kmers) = @_;
+  foreach my $old_kmer ( keys(%{$old_kmers}) ) {
+    my $instances = $old_kmers->{$old_kmer};
+    my $num_instances = scalar(@{$instances});
+    # print "## $old_kmer : $num_instances\n";
+    # (0 < $num_instances) || die;
+    if ( $num_instances == 1 ) {
+      my ($accession,$index,$strand) = @{$instances->[0]};
+      $results->{$accession}->[$index] = $old_k;
+      $num_results++;
+      if ( !$opt_q && $num_results % 100000 == 0 ) {
+	my $pers = 100.0*($num_results / $num_positions);
+	print STDERR "# finished: $num_results ($pers%)\n";
+      }
+    } else {
+      my $new_kmers = {};
+      foreach my $position ( @$instances ) {
+	my ($accession,$index,$strand) = @$position;
+	my $s = $molecules{$accession};
+	my $old_start = $index - ($old_k - 1)/2;
+	my $old_end = $old_start + $old_k - 1;
+	my $left = get($s,$old_start-$incr,$old_start-1);
+	my $right = get($s,$old_end+1,$old_end+$incr);
+	my $ss = $left . $right;
+	my $new_kmer = ($strand eq "+") ? $ss : rev_comp($ss);
+
+	if ( !defined($new_kmers->{$new_kmer}) ) {
+	  $new_kmers->{$new_kmer} = [];
+	}
+	push @{$new_kmers->{$new_kmer}}, $position;
+      }
+      recurs($old_k+$opt_D,$new_kmers);
+    }
+  }
+}
+
+# ------------------------------------------------------------------------
+# Write the results.
+# ------------------------------------------------------------------------
+
+if ( $opt_t ) {
+printf STDERR "# Write the results to %s/*_%s.profile\n", $opt_d, $opt_t;
+
+foreach my $accession (keys(%molecules)) {
+  my $a = $results->{$accession};
+  my $accession2 = $accession;
+  $accession2 =~ s/\.[0-9]+$//;
+  my $profile_filename = sprintf("%s/%s_%s.profile", $opt_d, $accession2, $opt_t);
+  open(my $fh, ">", $profile_filename) || die "Cannot open <<$profile_filename>>,";
+  for (my $i=0; $i<scalar(@{$a}); $i++) {
+    print $fh $a->[$i],"\n";
+  }
+  close $fh || die;
+}
+
+}
+
+if ( $opt_u ) {
+  printf STDERR "# Write the results to %s/*_%s.profile\n", $opt_d, $opt_u;
+
+  foreach my $accession (keys(%molecules)) {
+    my $a = $results->{$accession};
+    my $accession2 = $accession;
+    $accession2 =~ s/\.[0-9]+$//;
+    my $profile_filename = sprintf("%s/%s_%s.profile", $opt_d, $accession2, $opt_u);
+    open(my $fh, ">", $profile_filename) || die "Cannot open <<$profile_filename>>,";
+    for (my $i=0; $i<scalar(@{$a}); $i++) {
+      print $fh (1.0/$a->[$i]),"\n";
+    }
+    close $fh || die;
+  }
+}
+
+
+# ------------------------------------------------------------------------
+# Done.
+# ------------------------------------------------------------------------
+
+print STDERR "# Done.\n";
