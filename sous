@@ -99,6 +99,7 @@ foreach my $fasta_file ( @ARGV ) {
 	$molecules{$accession} = $sequence;
       }
       $accession = $1;
+      $accession =~ s/^lcl\|//;
       $sequence = "";
     } else {
       ( /^[ACGNTacgnt]/ ) || die "What is this? <<$_>>,";
